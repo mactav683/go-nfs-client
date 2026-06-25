@@ -1,2 +1,7 @@
 /plans
 /libnfs
+
+# Coverage artifacts (produced by `go test -coverprofile` / `go tool cover`).
+coverage.out
+coverage.txt
+coverage.html
