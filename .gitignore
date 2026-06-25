@@ -1,5 +1,6 @@
 /plans
 /libnfs
+.idea/
 
 # Coverage artifacts (produced by `go test -coverprofile` / `go tool cover`).
 coverage.out
