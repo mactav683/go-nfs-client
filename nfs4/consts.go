@@ -199,17 +199,36 @@ func errorHasStatus(err error, s Status) bool {
 	return false
 }
 
-// Is allows errors.Is(err, fs.ErrNotExist) etc. to match by status code.
+// Is allows errors.Is(err, fs.ErrNotExist) etc. to match by status code. The
+// mappings mirror the POSIX errno that a kernel NFS client would surface for
+// each nfsstat4, so callers can use the standard io/fs sentinels uniformly:
+//
+//   - fs.ErrNotExist:   the object (or its filehandle) no longer exists.
+//   - fs.ErrExist:      the object already exists.
+//   - fs.ErrPermission: the operation was denied by permission/ownership.
+//   - fs.ErrInvalid:    the request was malformed or otherwise invalid.
 func (e *StatusError) Is(target error) bool {
 	switch target {
 	case fs.ErrNotExist:
-		return e.Status == NFS4ERR_NOENT || e.Status == NFS4ERR_STALE
+		switch e.Status {
+		case NFS4ERR_NOENT, NFS4ERR_STALE, NFS4ERR_FHEXPIRED, NFS4ERR_NOFILEHANDLE:
+			return true
+		}
+		return false
 	case fs.ErrExist:
 		return e.Status == NFS4ERR_EXIST
 	case fs.ErrPermission:
-		return e.Status == NFS4ERR_PERM || e.Status == NFS4ERR_ACCESS
+		switch e.Status {
+		case NFS4ERR_PERM, NFS4ERR_ACCESS, NFS4ERR_ROFS:
+			return true
+		}
+		return false
 	case fs.ErrInvalid:
-		return e.Status == NFS4ERR_INVAL
+		switch e.Status {
+		case NFS4ERR_INVAL, NFS4ERR_BADXDR, NFS4ERR_BADHANDLE, NFS4ERR_BADTYPE:
+			return true
+		}
+		return false
 	}
 	return false
 }
@@ -267,4 +286,13 @@ var statusNames = map[Status]string{
 	NFS4ERR_BADOWNER:            "NFS4ERR_BADOWNER",
 	NFS4ERR_LOCKS_HELD:          "NFS4ERR_LOCKS_HELD",
 	NFS4ERR_RECLAIM_BAD:         "NFS4ERR_RECLAIM_BAD",
+	// NFSv4.1 session/state status codes.
+	NFS4ERR_BADSESSION:                "NFS4ERR_BADSESSION",
+	NFS4ERR_BADSLOT:                   "NFS4ERR_BADSLOT",
+	NFS4ERR_COMPLETE_ALREADY:          "NFS4ERR_COMPLETE_ALREADY",
+	NFS4ERR_SEQ_MISORDERED:            "NFS4ERR_SEQ_MISORDERED",
+	NFS4ERR_SEQUENCE_POS:              "NFS4ERR_SEQUENCE_POS",
+	NFS4ERR_DEADSESSION:               "NFS4ERR_DEADSESSION",
+	NFS4ERR_CONN_NOT_BOUND_TO_SESSION: "NFS4ERR_CONN_NOT_BOUND_TO_SESSION",
+	NFS4ERR_OP_ILLEGAL:                "NFS4ERR_OP_ILLEGAL",
 }

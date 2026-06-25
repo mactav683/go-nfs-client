@@ -1,0 +1,37 @@
+# Local NFSv4 server harness for go-nfs-client integration tests.
+#
+# Brings up a userspace NFS-Ganesha server exporting /export over NFSv4
+# (TCP/2049). Because go-nfs-client is a pure-userspace TCP client, the host
+# never runs `mount.nfs` — only the container serves NFS, and we talk to it over
+# TCP. This avoids needing kernel NFS modules / privileged kernel mounts on the
+# host.
+#
+# Usage:
+#   docker compose -f integration/docker-compose.yml up -d
+#   NFS_SERVER_ADDR=127.0.0.1:2049 NFS_EXPORT=/export \
+#     go test -tags integration ./...
+#   docker compose -f integration/docker-compose.yml down
+
+services:
+  nfs:
+    image: ${GANESHA_IMAGE:-ghcr.io/azhovan/docker-nfs-ganesha:latest}
+    container_name: go-nfs-client-ganesha
+    # Ganesha's FSAL_VFS performs operations (chown, setting arbitrary owners)
+    # that require broad capabilities; privileged is the simplest reliable
+    # setting for a throwaway test container.
+    privileged: true
+    ports:
+      - "2049:2049"
+    volumes:
+      - ./ganesha/export.conf:/etc/ganesha/ganesha.conf:ro
+      - nfsdata:/export
+    # A short healthcheck so `up --wait` blocks until 2049 accepts connections.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/2049' || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  nfsdata:

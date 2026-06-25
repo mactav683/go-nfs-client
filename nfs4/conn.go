@@ -37,6 +37,10 @@ type ConnConfig struct {
 	ClientName string
 	// MinorVersion selects the NFSv4 minor version (0 for v4.0).
 	MinorVersion uint32
+	// Retry tunes the bounded backoff-and-retry applied to retriable server
+	// responses (NFS4ERR_DELAY / NFS4ERR_GRACE). Zero fields use the package
+	// defaults (see DefaultRetry* constants).
+	Retry RetryConfig
 }
 
 // Conn is a logical NFSv4 connection: it owns the confirmed clientid, the root
@@ -104,8 +108,14 @@ func (c *Conn) teardownSession() {
 	if sess == nil {
 		return
 	}
+	// Unwrap to the caller beneath the sessionCaller so DESTROY_SESSION carries
+	// no SEQUENCE. The retryCaller is transparent (it forwards), so unwrap it
+	// too if present.
 	base := caller
-	if sc, ok := caller.(*sessionCaller); ok {
+	if rc, ok := base.(*retryCaller); ok {
+		base = rc.base
+	}
+	if sc, ok := base.(*sessionCaller); ok {
 		base = sc.base
 	}
 	ctx := context.Background()
@@ -119,9 +129,13 @@ func (c *Conn) teardownSession() {
 	_, _ = base.CallCompound(ctx, dcComp, []Res{&dcRes})
 }
 
-// NewConn returns a Conn that issues compounds through caller.
+// NewConn returns a Conn that issues compounds through caller. The supplied
+// caller is wrapped in a retryCaller so retriable server responses
+// (NFS4ERR_DELAY / NFS4ERR_GRACE) are transparently retried with bounded
+// backoff; the wrapper is the outermost decorator so each retry re-issues a
+// fresh SEQUENCE slot for v4.1 sessions.
 func NewConn(caller CompoundCaller, cfg ConnConfig) *Conn {
-	return &Conn{caller: caller, cfg: cfg}
+	return &Conn{caller: newRetryCaller(caller, cfg.Retry), cfg: cfg}
 }
 
 // ClientID returns the confirmed clientid established by Mount.
@@ -247,7 +261,17 @@ func (c *Conn) createSession(ctx context.Context) error {
 
 	c.mu.Lock()
 	c.session = sess
-	c.caller = newSessionCaller(c.caller, sess)
+	// Insert the sessionCaller beneath the outer retryCaller so the decorator
+	// order is retryCaller -> sessionCaller -> base. Each retry then re-issues a
+	// fresh SEQUENCE slot/seq, matching the server's expectation that a DELAY
+	// consumed the slot. If, for any reason, the outer caller is not a
+	// retryCaller (e.g. a test wired a bare caller), fall back to wrapping it
+	// directly.
+	if rc, ok := c.caller.(*retryCaller); ok {
+		rc.base = newSessionCaller(rc.base, sess)
+	} else {
+		c.caller = newSessionCaller(c.caller, sess)
+	}
 	c.mu.Unlock()
 	return nil
 }
