@@ -170,6 +170,31 @@ func TestFileInfoAdapter(t *testing.T) {
 	}
 }
 
+// TestEncodeFattrModeSize builds a settable fattr4 (mode + size) and decodes it
+// back, asserting the bitmap and encoded values round-trip.
+func TestEncodeFattrModeSize(t *testing.T) {
+	mode := uint32(0o600)
+	size := uint64(4096)
+	mask, vals := EncodeFattr(SettableAttrs{
+		Mode: &mode,
+		Size: &size,
+	})
+	// SIZE (4) precedes MODE (33) in attribute-number order.
+	if !mask.Has(AttrSize) || !mask.Has(AttrMode) {
+		t.Fatalf("mask missing size/mode: %v", mask)
+	}
+	got, err := Decode(mask, vals)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got.Size != size {
+		t.Fatalf("size = %d, want %d", got.Size, size)
+	}
+	if got.Mode != mode {
+		t.Fatalf("mode = %o, want %o", got.Mode, mode)
+	}
+}
+
 // TestRoundTripBitmap encodes then decodes a bitmap, preserving attr ordering.
 func TestRoundTripBitmap(t *testing.T) {
 	bm := BitmapFor(AttrType, AttrMode, AttrTimeModify)

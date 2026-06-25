@@ -125,3 +125,12 @@ func StandardMask() Bitmap {
 		AttrRawDev, AttrSpaceUsed, AttrTimeAccess, AttrTimeMetadata, AttrTimeModify,
 	)
 }
+
+// StatvfsMask is the bitmap requesting filesystem-statistics attributes
+// (matching libnfs's statvfs_attributes).
+func StatvfsMask() Bitmap {
+	return BitmapFor(
+		AttrFSID, AttrFilesAvail, AttrFilesFree, AttrFilesTotal, AttrMaxName,
+		AttrSpaceAvail, AttrSpaceFree, AttrSpaceTotal,
+	)
+}

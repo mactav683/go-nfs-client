@@ -53,6 +53,27 @@ type Conn struct {
 	clientID uint64
 	confirm  [8]byte
 	rootFH   FileHandle
+
+	// session is the negotiated v4.1 session, nil for v4.0 connections.
+	session *Session
+	// eirSequence is the sequence id returned by EXCHANGE_ID, used as the
+	// csa_sequence in CREATE_SESSION (v4.1).
+	eirSequence uint32
+
+	// openSeqid is the monotonically increasing open-owner seqid (v4.0).
+	openSeqid uint32
+}
+
+// MinorVersion returns the NFSv4 minor version this connection negotiated.
+func (c *Conn) MinorVersion() uint32 {
+	return c.cfg.MinorVersion
+}
+
+// Session returns the negotiated v4.1 session, or nil for v4.0 connections.
+func (c *Conn) Session() *Session {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.session
 }
 
 // closer is the subset of the RPC client Conn needs for lifecycle management.
@@ -60,12 +81,42 @@ type closer interface {
 	Close() error
 }
 
-// Close releases the underlying RPC connection, if any.
+// Close tears down session/client state (v4.1) and releases the underlying RPC
+// connection, if any. Session teardown is best-effort: its errors are not
+// returned, only the transport close error is.
 func (c *Conn) Close() error {
+	c.teardownSession()
 	if c.rpc != nil {
 		return c.rpc.Close()
 	}
 	return nil
+}
+
+// teardownSession issues DESTROY_SESSION and DESTROY_CLIENTID for v4.1
+// connections. DESTROY_SESSION must not carry SEQUENCE, so it is sent through
+// the base caller beneath the sessionCaller.
+func (c *Conn) teardownSession() {
+	c.mu.RLock()
+	sess := c.session
+	caller := c.caller
+	clientID := c.clientID
+	c.mu.RUnlock()
+	if sess == nil {
+		return
+	}
+	base := caller
+	if sc, ok := caller.(*sessionCaller); ok {
+		base = sc.base
+	}
+	ctx := context.Background()
+
+	var dsRes DestroySessionRes
+	dsComp := c.compound().Add(DestroySessionArgs{SessionID: sess.ID()})
+	_, _ = base.CallCompound(ctx, dsComp, []Res{&dsRes})
+
+	var dcRes DestroyClientIDRes
+	dcComp := c.compound().Add(DestroyClientIDArgs{ClientID: clientID})
+	_, _ = base.CallCompound(ctx, dcComp, []Res{&dcRes})
 }
 
 // NewConn returns a Conn that issues compounds through caller.
@@ -94,10 +145,16 @@ func (c *Conn) compound() *Compound {
 	return cc
 }
 
-// Mount performs the v4.0 bootstrap: establish and confirm a clientid, then
-// fetch the export root filehandle. The flow mirrors libnfs's nfs4_mount_async
-// (SETCLIENTID -> SETCLIENTID_CONFIRM -> PUTROOTFH/GETFH).
+// Mount performs the bootstrap appropriate to the configured minor version.
+//
+// For v4.0 the flow mirrors libnfs's nfs4_mount_async (SETCLIENTID ->
+// SETCLIENTID_CONFIRM -> PUTROOTFH/GETFH). For v4.1 it runs EXCHANGE_ID ->
+// CREATE_SESSION, installs the SEQUENCE-prepending caller, issues
+// RECLAIM_COMPLETE, then PUTROOTFH/GETFH.
 func (c *Conn) Mount(ctx context.Context) error {
+	if c.cfg.MinorVersion >= MinorV41 {
+		return c.mountV41(ctx)
+	}
 	if err := c.setClientID(ctx); err != nil {
 		return err
 	}
@@ -105,6 +162,108 @@ func (c *Conn) Mount(ctx context.Context) error {
 		return err
 	}
 	return c.fetchRootFH(ctx)
+}
+
+// mountV41 establishes a v4.1 session and fetches the root filehandle. The
+// EXCHANGE_ID and CREATE_SESSION compounds are sent through the base caller
+// (they must not carry SEQUENCE); once the session exists, c.caller is replaced
+// with a sessionCaller so every subsequent compound is SEQUENCE-prefixed.
+func (c *Conn) mountV41(ctx context.Context) error {
+	if err := c.exchangeID(ctx); err != nil {
+		return err
+	}
+	if err := c.createSession(ctx); err != nil {
+		return err
+	}
+	// Best-effort reclaim-complete; servers require it before normal ops but a
+	// non-OK status here is surfaced.
+	if err := c.reclaimComplete(ctx); err != nil {
+		return err
+	}
+	return c.fetchRootFH(ctx)
+}
+
+// exchangeID issues EXCHANGE_ID and stores the returned clientid and sequence.
+func (c *Conn) exchangeID(ctx context.Context) error {
+	var verifier [VerifierSize]byte
+	if _, err := rand.Read(verifier[:]); err != nil {
+		return fmt.Errorf("nfs4: generating exchange-id verifier: %w", err)
+	}
+	args := ExchangeIDArgs{
+		Verifier: verifier,
+		OwnerID:  []byte(c.clientName()),
+		Flags:    ExchgIDFlagUseNonPNFS,
+	}
+	var res ExchangeIDRes
+	comp := c.compound().Add(args)
+	if _, err := c.caller.CallCompound(ctx, comp, []Res{&res}); err != nil {
+		return fmt.Errorf("nfs4: EXCHANGE_ID: %w", err)
+	}
+	if err := res.Status.Err(); err != nil {
+		return fmt.Errorf("nfs4: EXCHANGE_ID rejected: %w", err)
+	}
+	c.mu.Lock()
+	c.clientID = res.ClientID
+	c.eirSequence = res.SequenceID
+	c.mu.Unlock()
+	return nil
+}
+
+// createSession issues CREATE_SESSION, builds the slot table, and swaps in the
+// SEQUENCE-prepending caller.
+func (c *Conn) createSession(ctx context.Context) error {
+	c.mu.RLock()
+	clientID := c.clientID
+	seq := c.eirSequence
+	c.mu.RUnlock()
+
+	chan_ := ChannelAttrs{
+		MaxRequestSize:      1 << 20,
+		MaxResponseSize:     1 << 20,
+		MaxResponseSizeCach: 1 << 16,
+		MaxOperations:       16,
+		MaxRequests:         DefaultSlotCount,
+	}
+	args := CreateSessionArgs{
+		ClientID:   clientID,
+		SequenceID: seq,
+		ForeChan:   chan_,
+		BackChan:   chan_,
+	}
+	var res CreateSessionRes
+	comp := c.compound().Add(args)
+	if _, err := c.caller.CallCompound(ctx, comp, []Res{&res}); err != nil {
+		return fmt.Errorf("nfs4: CREATE_SESSION: %w", err)
+	}
+	if err := res.Status.Err(); err != nil {
+		return fmt.Errorf("nfs4: CREATE_SESSION rejected: %w", err)
+	}
+
+	slotCount := int(res.ForeChan.MaxRequests)
+	if slotCount < 1 {
+		slotCount = 1
+	}
+	sess := NewSession(res.SessionID, slotCount)
+
+	c.mu.Lock()
+	c.session = sess
+	c.caller = newSessionCaller(c.caller, sess)
+	c.mu.Unlock()
+	return nil
+}
+
+// reclaimComplete issues RECLAIM_COMPLETE (global form) through the session.
+func (c *Conn) reclaimComplete(ctx context.Context) error {
+	var res ReclaimCompleteRes
+	comp := c.compound().Add(ReclaimCompleteArgs{OneFS: false})
+	if _, err := c.caller.CallCompound(ctx, comp, []Res{&res}); err != nil {
+		return fmt.Errorf("nfs4: RECLAIM_COMPLETE: %w", err)
+	}
+	// NFS4ERR_COMPLETE_ALREADY is benign (already reclaimed).
+	if res.Status != NFS4_OK && res.Status != NFS4ERR_COMPLETE_ALREADY {
+		return fmt.Errorf("nfs4: RECLAIM_COMPLETE rejected: %w", res.Status.Err())
+	}
+	return nil
 }
 
 // clientName returns the configured client name or a hostname-derived default.
@@ -285,6 +444,17 @@ func (c *Conn) Readdir(ctx context.Context, dir FileHandle, cookie uint64, cooki
 		return nil, ddRes.Status.Err()
 	}
 	return &ddRes, nil
+}
+
+// Renew issues a RENEW for the connection's clientid, keeping its leases alive.
+func (c *Conn) Renew(ctx context.Context) error {
+	id := c.ClientID()
+	var res StatusRes
+	comp := c.compound().Add(RenewArgs{ClientID: id})
+	if _, err := c.caller.CallCompound(ctx, comp, []Res{&res}); err != nil {
+		return fmt.Errorf("nfs4: RENEW: %w", err)
+	}
+	return res.Status.Err()
 }
 
 // Readlink issues PUTFH(fh) + READLINK and returns the symlink target.

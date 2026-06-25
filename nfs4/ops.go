@@ -314,6 +314,19 @@ func (r *ReadlinkRes) DecodeRes(d *xdr.Decoder) {
 	}
 }
 
+// --- RENEW ---
+
+// RenewArgs renews all leases held by the client identified by ClientID.
+type RenewArgs struct {
+	ClientID uint64
+}
+
+func (RenewArgs) Op() Opnum { return OpRenew }
+func (a RenewArgs) EncodeArg(e *xdr.Encoder) {
+	e.Uint32(uint32(OpRenew))
+	e.Uint64(a.ClientID)
+}
+
 // --- Shared status-only result ---
 
 // StatusRes decodes operations whose result is a bare nfsstat4: PUTFH,

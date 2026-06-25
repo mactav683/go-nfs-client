@@ -35,7 +35,8 @@ func NewRPCCaller(client *rpc.Client) *RPCCaller {
 
 // Dial connects to an NFSv4 server at address (host:port) using the given RPC
 // credentials and returns a mounted Conn whose root filehandle points at the
-// server's pseudo-root. The caller resolves exports beneath it with Lookup.
+// server's pseudo-root. The configured cfg.MinorVersion selects v4.0 or v4.1.
+// The caller resolves exports beneath it with Lookup.
 func Dial(ctx context.Context, address string, cred rpc.OpaqueAuth, cfg ConnConfig) (*Conn, error) {
 	cli, err := rpc.Dial(ctx, address, rpc.ClientOptions{Cred: cred, Verf: rpc.AuthNull()})
 	if err != nil {
@@ -48,6 +49,41 @@ func Dial(ctx context.Context, address string, cred rpc.OpaqueAuth, cfg ConnConf
 	}
 	conn.rpc = cli
 	return conn, nil
+}
+
+// DialAuto connects and negotiates the highest minor version the server
+// supports: it attempts v4.1 first and falls back to v4.0 when the server
+// rejects the minor version (NFS4ERR_MINOR_VERS_MISMATCH) or does not implement
+// the v4.1 session operations (NFS4ERR_NOTSUPP / NFS4ERR_OP_ILLEGAL). The
+// negotiated version is observable via Conn.MinorVersion.
+func DialAuto(ctx context.Context, address string, cred rpc.OpaqueAuth, cfg ConnConfig) (*Conn, error) {
+	v41 := cfg
+	v41.MinorVersion = MinorV41
+	conn, err := Dial(ctx, address, cred, v41)
+	if err == nil {
+		return conn, nil
+	}
+	if !isMinorVersionFallback(err) {
+		return nil, err
+	}
+	v40 := cfg
+	v40.MinorVersion = MinorV40
+	return Dial(ctx, address, cred, v40)
+}
+
+// isMinorVersionFallback reports whether err indicates the server does not
+// support the attempted (v4.1) minor version and a v4.0 retry is warranted.
+func isMinorVersionFallback(err error) bool {
+	for _, s := range []Status{
+		NFS4ERR_MINOR_VERS_MISMATCH,
+		NFS4ERR_NOTSUPP,
+		NFS4ERR_OP_ILLEGAL,
+	} {
+		if errorHasStatus(err, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // CallCompound encodes c, sends it as procedure NFSPROC4_COMPOUND, and decodes

@@ -15,6 +15,7 @@
 package nfs4
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 )
@@ -32,6 +33,13 @@ const (
 	FHSize       = 128 // NFS4_FHSIZE
 	VerifierSize = 8   // NFS4_VERIFIER_SIZE
 	OpaqueLimit  = 1024
+	SessionIDLen = 16 // NFS4_SESSIONID_SIZE
+)
+
+// Minor versions of the NFSv4 protocol.
+const (
+	MinorV40 uint32 = 0
+	MinorV41 uint32 = 1
 )
 
 // Opnum is the nfs_opnum4 operation number (nfs4.x:2073).
@@ -144,6 +152,15 @@ const (
 	NFS4ERR_BADOWNER            Status = 10039
 	NFS4ERR_LOCKS_HELD          Status = 10037
 	NFS4ERR_RECLAIM_BAD         Status = 10034
+	// NFSv4.1 session/state status codes.
+	NFS4ERR_BADSESSION                Status = 10052
+	NFS4ERR_BADSLOT                   Status = 10053
+	NFS4ERR_COMPLETE_ALREADY          Status = 10054
+	NFS4ERR_SEQ_MISORDERED            Status = 10063
+	NFS4ERR_SEQUENCE_POS              Status = 10064
+	NFS4ERR_DEADSESSION               Status = 10078
+	NFS4ERR_CONN_NOT_BOUND_TO_SESSION Status = 10080
+	NFS4ERR_OP_ILLEGAL                Status = 10044
 )
 
 // String returns the symbolic name for known status codes.
@@ -171,6 +188,15 @@ type StatusError struct {
 
 func (e *StatusError) Error() string {
 	return fmt.Sprintf("nfs4: %s", e.Status)
+}
+
+// errorHasStatus reports whether err wraps a *StatusError with the given status.
+func errorHasStatus(err error, s Status) bool {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Status == s
+	}
+	return false
 }
 
 // Is allows errors.Is(err, fs.ErrNotExist) etc. to match by status code.

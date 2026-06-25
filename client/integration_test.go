@@ -50,13 +50,27 @@ func authSys() rpc.OpaqueAuth {
 	}.OpaqueAuth()
 }
 
+// mountOpts returns Mount options selected by the NFS_MINORVERSION env var:
+// "1" forces v4.1, "auto" negotiates highest, anything else (or unset) uses
+// v4.0. This lets the same integration suite run against both minor versions.
+func mountOpts() []MountOption {
+	switch os.Getenv("NFS_MINORVERSION") {
+	case "1":
+		return []MountOption{WithMinorVersion(1)}
+	case "auto":
+		return []MountOption{WithAutoMinorVersion()}
+	default:
+		return nil
+	}
+}
+
 // TestReadPathLive mounts the export and exercises the io/fs read surface
 // against the live server: WalkDir traversal and reading file contents.
 func TestReadPathLive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cli, err := Mount(ctx, serverAddr(), exportName(), authSys())
+	cli, err := Mount(ctx, serverAddr(), exportName(), authSys(), mountOpts()...)
 	if err != nil {
 		t.Fatalf("Mount: %v", err)
 	}

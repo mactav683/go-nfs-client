@@ -99,13 +99,39 @@ func (fsys *FS) stat(fh nfs4.FileHandle) (*attr.Attributes, error) {
 	return attr.Decode(attr.Bitmap(mask), vals)
 }
 
-// pathError wraps err in an *fs.PathError for op on name, preserving sentinel
-// matching via errors.Is.
+// pathError wraps err in an *fs.PathError for op on name. When the underlying
+// NFS status maps to a canonical fs.Err* sentinel, that sentinel is used as the
+// PathError's Err so the legacy os.IsExist/os.IsNotExist/os.IsPermission
+// predicates behave as they do for local files. Those predicates unwrap an
+// *fs.PathError and compare its Err by identity (not via errors.Is), so the
+// returned value must have dynamic type *fs.PathError with Err set to the bare
+// sentinel. errors.Is(err, fs.Err*) continues to match, and errors.Is against a
+// specific NFS status continues to match for the non-mapped case where the
+// original error is preserved verbatim.
 func pathError(op, name string, err error) error {
 	if err == nil {
 		return nil
 	}
+	if sentinel := canonicalSentinel(err); sentinel != nil {
+		return &fs.PathError{Op: op, Path: name, Err: sentinel}
+	}
 	return &fs.PathError{Op: op, Path: name, Err: err}
+}
+
+// canonicalSentinel returns the fs.Err* sentinel err maps to, or nil.
+func canonicalSentinel(err error) error {
+	switch {
+	case errors.Is(err, fs.ErrExist):
+		return fs.ErrExist
+	case errors.Is(err, fs.ErrNotExist):
+		return fs.ErrNotExist
+	case errors.Is(err, fs.ErrPermission):
+		return fs.ErrPermission
+	case errors.Is(err, fs.ErrInvalid):
+		return fs.ErrInvalid
+	default:
+		return nil
+	}
 }
 
 // Open implements fs.FS. It returns an *fs.PathError wrapping fs.ErrNotExist for
