@@ -1,0 +1,207 @@
+# Continuous integration for go-nfs-client.
+#
+# Uses Go's built-in tooling only (go build / go vet / gofmt / go test
+# -coverprofile / go tool cover). Test output is intentionally verbose (-v) so a
+# green check is backed by visible, per-test evidence in the run logs.
+#
+# Jobs:
+#   - lint:        gofmt + go vet (unit and integration build tags)
+#   - test:        unit tests (verbose) with coverage, per-package + total
+#   - integration: full //go:build integration suite (verbose) against a
+#                  Dockerized NFS-Ganesha server (v4.0, v4.1, auto), with the
+#                  server log surfaced every run.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  lint:
+    name: Lint (gofmt + vet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - name: Environment
+        run: |
+          echo "::group::go version"
+          go version
+          echo "::endgroup::"
+          echo "::group::go env"
+          go env
+          echo "::endgroup::"
+
+      - name: gofmt (must be clean)
+        run: |
+          echo "Checking gofmt on: nfs4 client rpc xdr"
+          unformatted="$(gofmt -l nfs4 client rpc xdr)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "All files are gofmt-clean."
+
+      - name: go vet (default build tags)
+        run: go vet -v ./...
+
+      - name: go vet (integration build tags)
+        run: go vet -v -tags integration ./...
+
+  test:
+    name: Unit tests + coverage
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with the `go` directive in go.mod.
+        go: ["1.24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: Environment
+        run: |
+          echo "::group::go version"; go version; echo "::endgroup::"
+          echo "::group::go env";     go env;     echo "::endgroup::"
+
+      - name: List packages and tests
+        run: |
+          echo "::group::packages"
+          go list ./...
+          echo "::endgroup::"
+          echo "::group::test functions"
+          go test -list '.*' ./... || true
+          echo "::endgroup::"
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test (verbose, race, coverage)
+        run: go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage report (per-function + total)
+        run: |
+          echo "::group::go tool cover -func"
+          go tool cover -func=coverage.out | tee coverage.txt
+          echo "::endgroup::"
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')"
+          echo "Total coverage: ${total}"
+          {
+            echo "## Coverage (Go ${{ matrix.go }})"
+            echo ""
+            echo "**Total: ${total}**"
+            echo ""
+            echo '<details><summary>Per-function</summary>'
+            echo ""
+            echo '```'
+            cat coverage.txt
+            echo '```'
+            echo ""
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate HTML coverage report
+        if: matrix.go == '1.24'
+        run: go tool cover -html=coverage.out -o coverage.html
+
+      - name: Upload coverage artifacts
+        if: matrix.go == '1.24'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.txt
+            coverage.html
+          if-no-files-found: error
+
+  integration:
+    name: Integration (Dockerized NFSv4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        minorversion: ["", "1", "auto"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - name: Environment
+        run: |
+          echo "::group::go version";     go version;        echo "::endgroup::"
+          echo "::group::docker version"; docker version;    echo "::endgroup::"
+          echo "::group::docker compose"; docker compose version; echo "::endgroup::"
+
+      - name: Build integration tests
+        run: go build -v -tags integration ./...
+
+      - name: Bring up NFS-Ganesha
+        run: docker compose -f integration/docker-compose.yml up -d --build --wait
+
+      - name: Server status
+        run: |
+          echo "::group::container ps"
+          docker ps --filter name=go-nfs-client-ganesha
+          echo "::endgroup::"
+          echo "::group::ganesha startup log"
+          docker logs go-nfs-client-ganesha
+          echo "::endgroup::"
+          echo "::group::listening on 2049?"
+          docker exec go-nfs-client-ganesha sh -c 'ss -tlnp 2>/dev/null | grep 2049 || (</dev/tcp/127.0.0.1/2049 && echo "2049 accepting")' || true
+          echo "::endgroup::"
+
+      - name: Seed pre-existing file
+        run: |
+          docker exec \
+            -e SEED_NAME=preexisting.txt \
+            -e SEED_CONTENT="hello from the server before the client connected" \
+            go-nfs-client-ganesha \
+            sh -c 'printf "%s" "$SEED_CONTENT" > "/export/$SEED_NAME"'
+          echo "::group::export contents"
+          docker exec go-nfs-client-ganesha ls -l /export
+          echo "::endgroup::"
+
+      - name: Run integration suite (verbose)
+        env:
+          NFS_SERVER_ADDR: 127.0.0.1:2049
+          NFS_EXPORT: /
+          NFS_MINORVERSION: ${{ matrix.minorversion }}
+          NFS_EXISTING_FILE: preexisting.txt
+          NFS_EXISTING_CONTENT: "hello from the server before the client connected"
+        run: |
+          echo "Running with NFS_MINORVERSION='${NFS_MINORVERSION}'"
+          go test -v -tags integration -timeout 300s ./...
+
+      - name: Ganesha log (post-run)
+        if: always()
+        run: |
+          echo "::group::ganesha log (post-run)"
+          docker logs go-nfs-client-ganesha || true
+          echo "::endgroup::"
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f integration/docker-compose.yml down -v || true
