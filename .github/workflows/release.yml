@@ -34,23 +34,38 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
 
+      - name: Environment
+        run: |
+          echo "::group::go version"; go version; echo "::endgroup::"
+          echo "::group::go env";     go env;     echo "::endgroup::"
+
       - name: gofmt (must be clean)
         run: |
           unformatted="$(gofmt -l nfs4 client rpc xdr)"
           if [ -n "$unformatted" ]; then
-            echo "Not gofmt-clean:"; echo "$unformatted"; exit 1
+            echo "::error::Not gofmt-clean:"; echo "$unformatted"; exit 1
           fi
+          echo "All files are gofmt-clean."
 
-      - name: Vet, build, test
+      - name: Vet (verbose, both build tags)
         run: |
-          go vet ./...
-          go vet -tags integration ./...
-          go build ./...
-          go build -tags integration ./...
-          go test -race -covermode=atomic -coverprofile=coverage.out ./...
+          go vet -v ./...
+          go vet -v -tags integration ./...
 
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Build (verbose, both build tags)
+        run: |
+          go build -v ./...
+          go build -v -tags integration ./...
+
+      - name: Test (verbose, race, coverage)
+        run: go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage report (per-function + total)
+        run: |
+          echo "::group::go tool cover -func"
+          go tool cover -func=coverage.out | tee coverage.txt
+          echo "::endgroup::"
+          go tool cover -func=coverage.out >> "$GITHUB_STEP_SUMMARY"
 
   integration:
     name: Integration gate
@@ -66,6 +81,11 @@ jobs:
       - name: Bring up NFS-Ganesha
         run: docker compose -f integration/docker-compose.yml up -d --build --wait
 
+      - name: Server status
+        run: |
+          echo "::group::container ps"; docker ps --filter name=go-nfs-client-ganesha; echo "::endgroup::"
+          echo "::group::ganesha startup log"; docker logs go-nfs-client-ganesha; echo "::endgroup::"
+
       - name: Seed pre-existing file
         run: |
           docker exec \
@@ -73,14 +93,20 @@ jobs:
             -e SEED_CONTENT="hello from the server before the client connected" \
             go-nfs-client-ganesha \
             sh -c 'printf "%s" "$SEED_CONTENT" > "/export/$SEED_NAME"'
+          echo "::group::export contents"; docker exec go-nfs-client-ganesha ls -l /export; echo "::endgroup::"
 
-      - name: Run integration suite
+      - name: Run integration suite (verbose)
         env:
           NFS_SERVER_ADDR: 127.0.0.1:2049
           NFS_EXPORT: /
           NFS_EXISTING_FILE: preexisting.txt
           NFS_EXISTING_CONTENT: "hello from the server before the client connected"
-        run: go test -tags integration -timeout 300s ./...
+        run: go test -v -tags integration -timeout 300s ./...
+
+      - name: Ganesha log (post-run)
+        if: always()
+        run: |
+          echo "::group::ganesha log (post-run)"; docker logs go-nfs-client-ganesha || true; echo "::endgroup::"
 
       - name: Tear down
         if: always()
