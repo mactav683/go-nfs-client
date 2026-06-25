@@ -17,12 +17,14 @@
 package nfs4
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mactav683/go-nfs-client/nfs4/attr"
 	"github.com/mactav683/go-nfs-client/rpc"
 )
 
@@ -97,5 +99,85 @@ func TestMountNonexistentExport(t *testing.T) {
 	_, err = conn.LookupPath(ctx, []string{"definitely-not-here-12345"})
 	if err == nil {
 		t.Fatalf("expected error looking up nonexistent path")
+	}
+}
+
+// existingFile returns the name and expected content of a file that is
+// provisioned on the server independently of the client (the integration
+// harness seeds it before the tests run). When NFS_EXISTING_FILE is unset the
+// test that uses it skips, so the suite still runs against arbitrary servers.
+func existingFile() (name, content string, ok bool) {
+	name = os.Getenv("NFS_EXISTING_FILE")
+	if name == "" {
+		return "", "", false
+	}
+	return name, os.Getenv("NFS_EXISTING_CONTENT"), true
+}
+
+// TestExistingFilePresent asserts that, immediately after connecting to the NFS
+// share, a pre-existing file (created out-of-band on the server) is visible:
+// it resolves via LOOKUP under the export, GETATTR reports a regular file, and
+// its contents read back exactly. This proves the client observes server state
+// it did not itself create.
+func TestExistingFilePresent(t *testing.T) {
+	name, want, ok := existingFile()
+	if !ok {
+		t.Skip("set NFS_EXISTING_FILE (and NFS_EXISTING_CONTENT) to run; the harness seeds it")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn, err := Dial(ctx, serverAddr(), authSys(), ConnConfig{ClientName: "go-nfs-test"})
+	if err != nil {
+		t.Fatalf("Dial/Mount: %v", err)
+	}
+	defer conn.Close()
+
+	dir, err := conn.LookupPath(ctx, exportPath())
+	if err != nil {
+		t.Fatalf("LookupPath(export): %v", err)
+	}
+
+	// The file must already exist under the export.
+	fh, err := conn.Lookup(ctx, dir, name)
+	if err != nil {
+		t.Fatalf("pre-existing file %q not found via LOOKUP: %v", name, err)
+	}
+
+	// GETATTR must report a regular file with the expected size.
+	mask, vals, err := conn.GetAttr(ctx, fh, Bitmap(attr.StandardMask()))
+	if err != nil {
+		t.Fatalf("GetAttr(%q): %v", name, err)
+	}
+	attrs, err := attr.Decode(attr.Bitmap(mask), vals)
+	if err != nil {
+		t.Fatalf("decoding attributes for %q: %v", name, err)
+	}
+	if attrs.Type != attr.FtypeReg {
+		t.Fatalf("%q type = %v, want regular file (FtypeReg)", name, attrs.Type)
+	}
+	if want != "" && attrs.Size != uint64(len(want)) {
+		t.Fatalf("%q size = %d, want %d", name, attrs.Size, len(want))
+	}
+
+	// Contents must read back exactly.
+	if want != "" {
+		var got []byte
+		off := uint64(0)
+		for {
+			data, eof, rerr := conn.Read(ctx, fh, off, 8192)
+			if rerr != nil {
+				t.Fatalf("Read(%q): %v", name, rerr)
+			}
+			got = append(got, data...)
+			off += uint64(len(data))
+			if eof || len(data) == 0 {
+				break
+			}
+		}
+		if !bytes.Equal(got, []byte(want)) {
+			t.Fatalf("%q content = %q, want %q", name, got, want)
+		}
 	}
 }

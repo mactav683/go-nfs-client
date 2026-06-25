@@ -14,7 +14,10 @@
 
 services:
   nfs:
-    image: ${GANESHA_IMAGE:-ghcr.io/azhovan/docker-nfs-ganesha:latest}
+    build:
+      context: ./ganesha
+      dockerfile: Dockerfile
+    image: go-nfs-client/ganesha:local
     container_name: go-nfs-client-ganesha
     # Ganesha's FSAL_VFS performs operations (chown, setting arbitrary owners)
     # that require broad capabilities; privileged is the simplest reliable
